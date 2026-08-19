@@ -1,4 +1,5 @@
 import io
+import os
 import re
 from datetime import date
 
@@ -14,6 +15,15 @@ except ImportError:
     xlrd = None
 
 st.set_page_config(page_title="행사제안서 자동생성기", layout="wide")
+
+# ---------------------------------------------------------------
+# 기준 파일을 서버(로컬 실행 폴더)에 저장해 두고 재사용하기 위한 경로
+# ---------------------------------------------------------------
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+COST_DIR = os.path.join(DATA_DIR, "cost")
+PRICE_DIR = os.path.join(DATA_DIR, "price")
+os.makedirs(COST_DIR, exist_ok=True)
+os.makedirs(PRICE_DIR, exist_ok=True)
 
 # ---------------------------------------------------------------
 # 고정 컬럼 위치 (0-indexed, A=0)
@@ -293,70 +303,52 @@ def iround(v):
 
 
 # ---------------------------------------------------------------
-# UI
+# 기준 파일 저장/로드
 # ---------------------------------------------------------------
-st.title("행사제안서 자동생성기")
-st.caption("기준 파일 업로드 → 품번 입력 → 수수료/배송비 설정 → 엑셀 다운로드")
-
-col1, col2 = st.columns(2)
-
-with col1:
-    st.subheader("1. 기준 파일 업로드")
-    st.caption(".xls = 원가 파일(오클릭)  |  .xlsx = 가격표 파일. 여러 개 업로드 가능합니다.")
-    uploaded = st.file_uploader(
-        "파일을 드래그하거나 클릭하여 업로드",
-        type=["xls", "xlsx"],
-        accept_multiple_files=True,
-    )
-
-cost_map, price_map = {}, {}
-file_status = []
-if uploaded:
-    for f in uploaded:
+def save_uploaded_files(uploaded_files):
+    """업로드된 파일을 확장자에 따라 data/cost 또는 data/price 폴더에 저장(같은 이름이면 덮어씀)."""
+    for f in uploaded_files:
         ext = f.name.lower().rsplit(".", 1)[-1]
+        target_dir = COST_DIR if ext == "xls" else PRICE_DIR
+        with open(os.path.join(target_dir, f.name), "wb") as out:
+            out.write(f.getvalue())
+
+
+def load_saved_maps():
+    """저장된 폴더의 모든 파일을 읽어 cost_map/price_map과 상태 목록을 만든다."""
+    cost_map, price_map, status = {}, {}, []
+    for fn in sorted(os.listdir(COST_DIR)):
+        path = os.path.join(COST_DIR, fn)
         try:
-            rows = read_rows(f.getvalue(), ext)
-            if ext == "xls":
-                m = parse_cost_sheet(rows)
-                cost_map.update(m)
-                file_status.append((f.name, "원가 파일", len(m)))
-            else:
-                m = parse_price_sheet(rows)
-                price_map.update(m)
-                file_status.append((f.name, "가격표 파일", len(m)))
+            with open(path, "rb") as fh:
+                rows = read_rows(fh.read(), "xls")
+            m = parse_cost_sheet(rows)
+            cost_map.update(m)
+            status.append((fn, "원가 파일", len(m)))
         except Exception as e:
-            file_status.append((f.name, f"⚠️ 읽기 실패: {e}", 0))
+            status.append((fn, f"⚠️ 읽기 실패: {e}", 0))
+    for fn in sorted(os.listdir(PRICE_DIR)):
+        path = os.path.join(PRICE_DIR, fn)
+        try:
+            with open(path, "rb") as fh:
+                rows = read_rows(fh.read(), "xlsx")
+            m = parse_price_sheet(rows)
+            price_map.update(m)
+            status.append((fn, "가격표 파일", len(m)))
+        except Exception as e:
+            status.append((fn, f"⚠️ 읽기 실패: {e}", 0))
+    return cost_map, price_map, status
 
-with col1:
-    for name, kind, cnt in file_status:
-        st.write(f"- **{name}** — {kind} ({cnt}건 인식)")
 
-with col2:
-    st.subheader("2. 품번 입력")
-    sku_text = st.text_area(
-        "품번을 입력하세요. 엔터(줄바꿈) 또는 콤마로 여러 개 구분",
-        height=120,
-        placeholder="예) 102649, 102650\n102761",
-    )
-    lookup = st.button("조회하기", type="primary")
-
-if "rows" not in st.session_state:
-    st.session_state.rows = []
-
-if lookup:
-    seen, skus = set(), []
-    for tok in re.split(r"[\n,，]+", sku_text):
-        code = normalize_code(tok)
-        if code and code not in seen:
-            seen.add(code)
-            skus.append(code)
-    prev = {r["품번"]: r for r in st.session_state.rows}
-    new_rows = []
+def build_rows_from_skus(skus, cost_map, price_map, prev_rows):
+    """품번 리스트를 기준으로 결과 행을 만든다. 기존 행이 있으면 수수료/배송비/적용유형 등 편집값을 유지."""
+    prev = {r["품번"]: r for r in prev_rows}
+    rows = []
     for sku in skus:
         cost = cost_map.get(sku)
         price = price_map.get(sku)
         p = prev.get(sku, {})
-        new_rows.append(
+        rows.append(
             {
                 "품번": sku,
                 "상품코드": sku,
@@ -376,7 +368,143 @@ if lookup:
                 "배송비": p.get("배송비", 0.0),
             }
         )
-    st.session_state.rows = new_rows
+    return rows
+
+
+def search_by_name(query, cost_map):
+    """공백으로 구분된 키워드가 순서 상관없이 모두 포함된 품명을 검색."""
+    tokens = [t for t in re.split(r"\s+", query.strip()) if t]
+    if not tokens:
+        return []
+    matches = []
+    for code, info in cost_map.items():
+        name = info.get("품명", "")
+        if all(tok in name for tok in tokens):
+            matches.append((code, name))
+    return matches
+
+
+def show_no_match_popup(query):
+    """일치하는 품명이 없을 때 확인이 필요하다는 팝업(모달)을 띄운다."""
+    if hasattr(st, "dialog"):
+        @st.dialog("확인이 필요합니다")
+        def _dialog():
+            st.write(f"'{query}'와(과) 일치하는 품명을 찾을 수 없습니다.")
+            st.write("검색어를 다시 확인해주세요 (예: 띄어쓰기, 오탈자 등).")
+            if st.button("닫기"):
+                st.rerun()
+        _dialog()
+    else:
+        st.warning(f"'{query}'와(과) 일치하는 품명을 찾을 수 없습니다. 검색어를 다시 확인해주세요.")
+
+
+# ---------------------------------------------------------------
+# UI
+# ---------------------------------------------------------------
+st.title("행사제안서 자동생성기")
+st.caption("기준 파일 업로드 → 품번 입력 → 수수료/배송비 설정 → 엑셀 다운로드")
+
+col1, col2 = st.columns(2)
+
+with col1:
+    st.subheader("1. 기준 파일 업로드")
+    st.caption(
+        ".xls = 원가 파일(오클릭)  |  .xlsx = 가격표 파일. "
+        "한 번 업로드하면 서버에 저장되어 다음부터는 다시 올릴 필요가 없습니다. "
+        "교체하려면 같은 이름의 새 파일을 다시 업로드하세요."
+    )
+    uploaded = st.file_uploader(
+        "파일을 드래그하거나 클릭하여 업로드",
+        type=["xls", "xlsx"],
+        accept_multiple_files=True,
+        key="uploader",
+    )
+    if uploaded:
+        save_uploaded_files(uploaded)
+        st.success(f"{len(uploaded)}개 파일이 저장되었습니다.")
+
+    cost_files_on_disk = sorted(os.listdir(COST_DIR))
+    price_files_on_disk = sorted(os.listdir(PRICE_DIR))
+    if cost_files_on_disk or price_files_on_disk:
+        st.write("**저장된 기준 파일**")
+        for fn in cost_files_on_disk:
+            c1, c2 = st.columns([5, 1])
+            c1.write(f"📄 {fn} (원가)")
+            if c2.button("삭제", key=f"del_cost_{fn}"):
+                os.remove(os.path.join(COST_DIR, fn))
+                st.rerun()
+        for fn in price_files_on_disk:
+            c1, c2 = st.columns([5, 1])
+            c1.write(f"📄 {fn} (가격표)")
+            if c2.button("삭제", key=f"del_price_{fn}"):
+                os.remove(os.path.join(PRICE_DIR, fn))
+                st.rerun()
+    else:
+        st.info("저장된 기준 파일이 없습니다. 파일을 업로드해주세요.")
+
+cost_map, price_map, file_status = load_saved_maps()
+
+with col1:
+    with st.expander("파일 인식 상태 보기"):
+        for name, kind, cnt in file_status:
+            st.write(f"- **{name}** — {kind} ({cnt}건 인식)")
+
+if "rows" not in st.session_state:
+    st.session_state.rows = []
+if "name_search_results" not in st.session_state:
+    st.session_state.name_search_results = []
+
+with col2:
+    st.subheader("2. 품번 / 품명 입력")
+    tab_code, tab_name = st.tabs(["품번으로 입력", "품명으로 찾기"])
+
+    with tab_code:
+        sku_text = st.text_area(
+            "품번을 입력하세요. 엔터(줄바꿈) 또는 콤마로 여러 개 구분",
+            height=110,
+            placeholder="예) 102649, 102650\n102761",
+        )
+        lookup = st.button("조회하기", type="primary", key="lookup_by_code")
+        if lookup:
+            seen, skus = set(), []
+            for tok in re.split(r"[\n,，]+", sku_text):
+                code = normalize_code(tok)
+                if code and code not in seen:
+                    seen.add(code)
+                    skus.append(code)
+            st.session_state.rows = build_rows_from_skus(skus, cost_map, price_map, st.session_state.rows)
+
+    with tab_name:
+        name_query = st.text_input(
+            "품명 키워드를 입력하세요 (띄어쓰기로 구분, 순서 상관없이 검색됩니다)",
+            placeholder="예: 크리스탈 램프",
+        )
+        search_clicked = st.button("검색", key="search_by_name")
+        if search_clicked:
+            if not name_query.strip():
+                st.warning("검색어를 입력해주세요.")
+            else:
+                matches = search_by_name(name_query, cost_map)
+                if not matches:
+                    show_no_match_popup(name_query)
+                    st.session_state.name_search_results = []
+                else:
+                    st.session_state.name_search_results = matches
+
+        if st.session_state.name_search_results:
+            st.write(f"검색 결과 {len(st.session_state.name_search_results)}건 — 추가할 품목을 선택하세요.")
+            options = [f"{code} | {name}" for code, name in st.session_state.name_search_results]
+            selected = st.multiselect("품번 선택", options, key="name_search_select")
+            if st.button("선택한 품번 추가", key="add_selected_skus"):
+                codes = [s.split(" | ")[0] for s in selected]
+                if not codes:
+                    st.warning("추가할 품목을 먼저 선택해주세요.")
+                else:
+                    existing = [r["품번"] for r in st.session_state.rows]
+                    merged = existing + [c for c in codes if c not in existing]
+                    st.session_state.rows = build_rows_from_skus(merged, cost_map, price_map, st.session_state.rows)
+                    st.session_state.name_search_results = []
+                    st.rerun()
 
 st.subheader("3. 수수료 · 배송비 일괄 적용")
 b1, b2, b3 = st.columns([1, 1, 2])
