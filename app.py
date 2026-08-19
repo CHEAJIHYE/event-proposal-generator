@@ -229,8 +229,9 @@ def build_styled_excel(df, missing_flags):
     ws.append(headers)
 
     header_fill = PatternFill(start_color="ED7D31", end_color="ED7D31", fill_type="solid")
-    header_font = Font(bold=True, color="FFFFFF")
+    header_font = Font(bold=True, color="FFFFFF", size=10)
     missing_fill = PatternFill(start_color="FFF3B0", end_color="FFF3B0", fill_type="solid")
+    data_font = Font(size=10)
     thin = Side(style="thin", color="D9D9D9")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
@@ -249,6 +250,7 @@ def build_styled_excel(df, missing_flags):
         for c in range(1, len(headers) + 1):
             cell = ws.cell(row=r, column=c)
             cell.border = border
+            cell.font = data_font
             header = headers[c - 1]
             cell.alignment = Alignment(
                 horizontal="right" if header in MONEY_COLUMNS else "left", vertical="center"
@@ -446,7 +448,6 @@ else:
         display_rows.append(
             {
                 "품번": r["품번"],
-                "상품코드": r["상품코드"],
                 "품명": r["품명"],
                 "정상가(판매가)": iround(r["정상가"]),
                 "최저가": iround(r["최저가"]),
