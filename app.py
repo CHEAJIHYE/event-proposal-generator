@@ -658,8 +658,8 @@ with col2:
                     st.rerun()
 
 st.subheader("3. 수수료 · 배송비 일괄 적용")
-st.caption("결과표의 '적용' 체크박스가 켜진 행에만 일괄 적용됩니다. 개별 행은 결과표에서 직접 수정할 수 있습니다.")
-b1, b2, b3 = st.columns([1, 1, 2])
+st.caption("전체 행에 적용하거나, 결과표의 '적용' 체크박스가 켜진 행에만 적용할 수 있습니다.")
+b1, b2, b3, b4 = st.columns([1, 1, 1, 1])
 with b1:
     bulk_fee = st.number_input("수수료 일괄(%)", value=0.0, step=0.5)
 with b2:
@@ -667,7 +667,14 @@ with b2:
 with b3:
     st.write("")
     st.write("")
-    if st.button("체크된 행에 적용"):
+    if st.button("전체 행에 적용"):
+        for r in st.session_state.rows:
+            r["수수료"] = bulk_fee
+            r["배송비"] = bulk_ship
+with b4:
+    st.write("")
+    st.write("")
+    if st.button("체크된 행에만 적용"):
         for r in st.session_state.rows:
             if r.get("선택", True):
                 r["수수료"] = bulk_fee
@@ -687,7 +694,7 @@ else:
     st.caption(
         "※ 적용유형에서 금액이 비어있는 항목을 고르면 아래 결과표에 노란색으로 표시됩니다 "
         "(선택 자체는 가능하지만 금액이 없어 계산에서 제외됩니다). "
-        "'적용' 체크박스는 수수료·배송비 일괄 적용 대상 여부입니다."
+        "'적용' 체크박스는 '체크된 행에만 적용' 버튼을 눌렀을 때의 대상 여부입니다."
     )
 
     edited = st.data_editor(
