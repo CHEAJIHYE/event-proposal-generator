@@ -552,6 +552,11 @@ with col1:
             st.write(f"- **{name}** — {kind} ({cnt}건 인식)")
 
 st.subheader("1-2. 판매처(어드민 상품코드) 매핑 파일 업로드")
+if xlrd is None:
+    st.error(
+        "⚠️ `xlrd` 라이브러리가 설치되어 있지 않아 .xls 파일을 읽을 수 없습니다. "
+        "`pip install -r requirements.txt`로 xlrd를 설치한 뒤 다시 실행해주세요."
+    )
 st.caption(
     "파일명이 그대로 판매처명이 됩니다 (예: '스마트스토어.xls' 업로드 → 판매처 드롭다운에 '스마트스토어' 추가). "
     "오클릭 품번 ↔ 어드민 상품코드가 들어있는 파일을 올려주세요. 이 파일도 서버에 저장되어 계속 유지됩니다."
@@ -568,6 +573,16 @@ if channel_uploaded:
             out.write(f.getvalue())
     st.success(f"{len(channel_uploaded)}개 판매처 매핑 파일이 저장되었습니다.")
     channel_maps, channel_status = load_saved_channels()
+    uploaded_names = {f.name for f in channel_uploaded}
+    for fn, kind, cnt in channel_status:
+        if fn in uploaded_names:
+            if "⚠️" in kind:
+                st.error(f"**{fn}** 읽기 실패: {kind}")
+            elif cnt == 0:
+                st.warning(
+                    f"**{fn}**: 파일은 저장됐지만 오클릭 품번/어드민 상품코드를 하나도 인식하지 못했습니다. "
+                    "헤더에 '오클릭'과 '어드민 상품코드'라는 텍스트가 포함되어 있는지 확인해주세요."
+                )
 
 channel_files_on_disk = sorted(os.listdir(CHANNEL_DIR))
 if channel_files_on_disk:
