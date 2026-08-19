@@ -238,7 +238,9 @@ def calc_row(r, cost_raw):
     cost_vat_in = cost_raw
     cost_vat_ex = round(cost_raw / 1.1) if cost_raw is not None else None
     fee_dec = (r.get("수수료") or 0) / 100
-    supply_vat_in = round(event_price * (1 - fee_dec)) if event_price is not None else None
+    supply_vat_in_calc = round(event_price * (1 - fee_dec)) if event_price is not None else None
+    manual_supply = r.get("공급가_수동")
+    supply_vat_in = manual_supply if manual_supply is not None else supply_vat_in_calc
     supply_vat_ex = round(supply_vat_in / 1.1) if supply_vat_in is not None else None
     margin = (
         supply_vat_ex - cost_vat_ex - (r.get("배송비") or 0)
@@ -282,8 +284,6 @@ def build_styled_excel(df, missing_flags, recent_flags=None):
     red_font = Font(size=10, bold=True, color="D33333")
     thin = Side(style="thin", color="D9D9D9")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
-    red_thick = Side(style="medium", color="D33333")
-    red_border = Border(left=red_thick, right=red_thick, top=red_thick, bottom=red_thick)
 
     recent_flags = recent_flags or []
     sku_col_idx = headers.index("품번") + 1 if "품번" in headers else None
@@ -315,7 +315,6 @@ def build_styled_excel(df, missing_flags, recent_flags=None):
                 cell.fill = missing_fill
         if is_recent and sku_col_idx:
             sku_cell = ws.cell(row=r, column=sku_col_idx)
-            sku_cell.border = red_border
             sku_cell.font = red_font
 
     for idx, h in enumerate(headers, start=1):
@@ -475,6 +474,7 @@ def build_rows_from_skus(skus, cost_map, price_map, prev_rows):
                 "기타금액": p.get("기타금액", None),
                 "수수료": p.get("수수료", 0.0),
                 "배송비": p.get("배송비", 0.0),
+                "공급가_수동": p.get("공급가_수동", None),
                 "선택": p.get("선택", True),
             }
         )
@@ -495,17 +495,10 @@ def search_by_name(query, cost_map):
 
 
 def show_no_match_popup(query):
-    """일치하는 품명이 없을 때 확인이 필요하다는 팝업(모달)을 띄운다."""
-    if hasattr(st, "dialog"):
-        @st.dialog("확인이 필요합니다")
-        def _dialog():
-            st.write(f"'{query}'와(과) 일치하는 품명을 찾을 수 없습니다.")
-            st.write("검색어를 다시 확인해주세요 (예: 띄어쓰기, 오탈자 등).")
-            if st.button("닫기"):
-                st.rerun()
-        _dialog()
-    else:
-        st.warning(f"'{query}'와(과) 일치하는 품명을 찾을 수 없습니다. 검색어를 다시 확인해주세요.")
+    """일치하는 품명이 없을 때 확인이 필요하다는 안내를 보여준다.
+    (실시간 검색 방식으로 바뀌면서 타이핑 중 모달이 계속 뜨는 것을 피하기 위해
+    inline 메시지로 표시한다. 필요 시 이 함수를 다시 st.dialog로 바꿔 쓸 수 있다.)"""
+    st.info(f"'{query}'와(과) 일치하는 품명을 찾을 수 없습니다. 검색어를 다시 확인해주세요.")
 
 
 # ---------------------------------------------------------------
@@ -552,38 +545,31 @@ with col1:
     else:
         st.info("저장된 기준 파일이 없습니다. 파일을 업로드해주세요.")
 
-cost_map, price_map, file_status = load_saved_maps()
-channel_maps, channel_status = load_saved_channels()
-file_status = file_status + channel_status
-
-with col1:
-    with st.expander("파일 인식 상태 보기"):
-        for name, kind, cnt in file_status:
-            st.write(f"- **{name}** — {kind} ({cnt}건 인식)")
-
-st.subheader("1-2. 판매처(어드민 상품코드) 매핑 파일 업로드")
-if xlrd is None:
-    st.error(
-        "⚠️ `xlrd` 라이브러리가 설치되어 있지 않아 .xls 파일을 읽을 수 없습니다. "
-        "`pip install -r requirements.txt`로 xlrd를 설치한 뒤 다시 실행해주세요."
+with col2:
+    st.subheader("1-2. 판매처(어드민 상품코드) 매핑 파일 업로드")
+    if xlrd is None:
+        st.error(
+            "⚠️ `xlrd` 라이브러리가 설치되어 있지 않아 .xls 파일을 읽을 수 없습니다. "
+            "`pip install -r requirements.txt`로 xlrd를 설치한 뒤 다시 실행해주세요."
+        )
+    st.caption(
+        "파일명이 그대로 판매처명이 됩니다 (예: '스마트스토어.xls' 업로드 → 판매처 드롭다운에 '스마트스토어' 추가). "
+        "오클릭 품번 ↔ 어드민 상품코드가 들어있는 파일을 올려주세요. 이 파일도 서버에 저장되어 계속 유지됩니다."
     )
-st.caption(
-    "파일명이 그대로 판매처명이 됩니다 (예: '스마트스토어.xls' 업로드 → 판매처 드롭다운에 '스마트스토어' 추가). "
-    "오클릭 품번 ↔ 어드민 상품코드가 들어있는 파일을 올려주세요. 이 파일도 서버에 저장되어 계속 유지됩니다."
-)
-channel_uploaded = st.file_uploader(
-    "판매처 매핑 파일을 드래그하거나 클릭하여 업로드 (파일명 = 판매처명)",
-    type=["xls", "xlsx"],
-    accept_multiple_files=True,
-    key="channel_uploader",
-)
-if channel_uploaded:
-    for f in channel_uploaded:
-        with open(os.path.join(CHANNEL_DIR, f.name), "wb") as out:
-            out.write(f.getvalue())
-    st.success(f"{len(channel_uploaded)}개 판매처 매핑 파일이 저장되었습니다.")
+    channel_uploaded = st.file_uploader(
+        "판매처 매핑 파일을 드래그하거나 클릭하여 업로드 (파일명 = 판매처명)",
+        type=["xls", "xlsx"],
+        accept_multiple_files=True,
+        key="channel_uploader",
+    )
+    if channel_uploaded:
+        for f in channel_uploaded:
+            with open(os.path.join(CHANNEL_DIR, f.name), "wb") as out:
+                out.write(f.getvalue())
+        st.success(f"{len(channel_uploaded)}개 판매처 매핑 파일이 저장되었습니다.")
+
     channel_maps, channel_status = load_saved_channels()
-    uploaded_names = {f.name for f in channel_uploaded}
+    uploaded_names = {f.name for f in channel_uploaded} if channel_uploaded else set()
     for fn, kind, cnt in channel_status:
         if fn in uploaded_names:
             if "⚠️" in kind:
@@ -594,77 +580,91 @@ if channel_uploaded:
                     "헤더에 '오클릭'과 '어드민 상품코드'라는 텍스트가 포함되어 있는지 확인해주세요."
                 )
 
-channel_files_on_disk = sorted(os.listdir(CHANNEL_DIR))
-if channel_files_on_disk:
-    cc1, cc2 = st.columns(2)
-    for i, fn in enumerate(channel_files_on_disk):
-        target = cc1 if i % 2 == 0 else cc2
-        c1, c2 = target.columns([4, 1])
-        c1.write(f"🏬 {os.path.splitext(fn)[0]}")
-        if c2.button("삭제", key=f"del_channel_{fn}"):
-            os.remove(os.path.join(CHANNEL_DIR, fn))
-            st.rerun()
+    channel_options = ["(선택 안 함)"] + sorted(channel_maps.keys())
+    sel_col, del_col = st.columns([3, 1])
+    with sel_col:
+        selected_channel = st.selectbox("판매처 선택", channel_options, key="channel_select")
+    with del_col:
+        st.write("")
+        if selected_channel and selected_channel != "(선택 안 함)":
+            if st.button("삭제", key="del_selected_channel"):
+                for fn in os.listdir(CHANNEL_DIR):
+                    if os.path.splitext(fn)[0] == selected_channel:
+                        os.remove(os.path.join(CHANNEL_DIR, fn))
+                if "channel_select" in st.session_state:
+                    del st.session_state["channel_select"]
+                st.rerun()
+    if selected_channel == "(선택 안 함)":
+        selected_channel = None
 
-channel_options = ["(선택 안 함)"] + sorted(channel_maps.keys())
-selected_channel = st.selectbox("판매처 선택", channel_options, key="channel_select")
-if selected_channel == "(선택 안 함)":
-    selected_channel = None
+cost_map, price_map, file_status = load_saved_maps()
+file_status = file_status + channel_status
+
+with col1:
+    with st.expander("파일 인식 상태 보기"):
+        for name, kind, cnt in file_status:
+            st.write(f"- **{name}** — {kind} ({cnt}건 인식)")
 
 if "rows" not in st.session_state:
     st.session_state.rows = []
-if "name_search_results" not in st.session_state:
-    st.session_state.name_search_results = []
 
-with col2:
-    st.subheader("2. 품번 / 품명 입력")
-    tab_code, tab_name = st.tabs(["품번으로 입력", "품명으로 찾기"])
+st.subheader("2. 품번 / 품명 입력")
+tab_code, tab_name = st.tabs(["품번으로 입력", "품명으로 찾기"])
 
-    with tab_code:
-        sku_text = st.text_area(
-            "품번을 입력하세요. 엔터(줄바꿈) 또는 콤마로 여러 개 구분",
-            height=110,
-            placeholder="예) 102649, 102650\n102761",
-        )
-        lookup = st.button("조회하기", type="primary", key="lookup_by_code")
-        if lookup:
-            seen, skus = set(), []
-            for tok in re.split(r"[\n,，]+", sku_text):
-                code = normalize_code(tok)
-                if code and code not in seen:
-                    seen.add(code)
-                    skus.append(code)
-            st.session_state.rows = build_rows_from_skus(skus, cost_map, price_map, st.session_state.rows)
+with tab_code:
+    sku_text = st.text_area(
+        "품번을 입력하세요. 엔터(줄바꿈) 또는 콤마로 여러 개 구분",
+        height=110,
+        placeholder="예) 102649, 102650\n102761",
+    )
+    lookup = st.button("조회하기", type="primary", key="lookup_by_code")
+    if lookup:
+        seen, skus = set(), []
+        for tok in re.split(r"[\n,，]+", sku_text):
+            code = normalize_code(tok)
+            if code and code not in seen:
+                seen.add(code)
+                skus.append(code)
+        st.session_state.rows = build_rows_from_skus(skus, cost_map, price_map, st.session_state.rows)
 
-    with tab_name:
-        name_query = st.text_input(
-            "품명 키워드를 입력하세요 (띄어쓰기로 구분, 순서 상관없이 검색됩니다)",
-            placeholder="예: 크리스탈 램프",
-        )
-        search_clicked = st.button("검색", key="search_by_name")
-        if search_clicked:
-            if not name_query.strip():
-                st.warning("검색어를 입력해주세요.")
-            else:
-                matches = search_by_name(name_query, cost_map)
-                if not matches:
-                    show_no_match_popup(name_query)
-                    st.session_state.name_search_results = []
-                else:
-                    st.session_state.name_search_results = matches
+with tab_name:
+    name_query = st.text_input(
+        "품명 키워드를 입력하세요 (띄어쓰기로 구분, 순서 상관없이 검색됩니다). "
+        "엔터를 누르거나 다른 곳을 클릭하면 바로 아래에 결과가 나타납니다.",
+        placeholder="예: 크리스탈 램프",
+        key="name_query_input",
+    )
+    if name_query.strip():
+        matches = search_by_name(name_query, cost_map)
+        if not matches:
+            st.info(f"'{name_query}'와(과) 일치하는 품명을 찾을 수 없습니다. 검색어를 다시 확인해주세요.")
+        else:
+            st.write(f"검색 결과 {len(matches)}건")
+            top1, top2 = st.columns([1, 1])
+            with top1:
+                if st.button("전체 선택", key="select_all_names"):
+                    for code, _ in matches:
+                        st.session_state[f"name_chk_{code}"] = True
+            with top2:
+                if st.button("전체 해제", key="deselect_all_names"):
+                    for code, _ in matches:
+                        st.session_state[f"name_chk_{code}"] = False
 
-        if st.session_state.name_search_results:
-            st.write(f"검색 결과 {len(st.session_state.name_search_results)}건 — 추가할 품목을 선택하세요.")
-            options = [f"{code} | {name}" for code, name in st.session_state.name_search_results]
-            selected = st.multiselect("품번 선택", options, key="name_search_select")
+            selected_codes = []
+            for code, name in matches:
+                checked = st.checkbox(f"{code} | {name}", key=f"name_chk_{code}")
+                if checked:
+                    selected_codes.append(code)
+
             if st.button("선택한 품번 추가", key="add_selected_skus"):
-                codes = [s.split(" | ")[0] for s in selected]
-                if not codes:
+                if not selected_codes:
                     st.warning("추가할 품목을 먼저 선택해주세요.")
                 else:
                     existing = [r["품번"] for r in st.session_state.rows]
-                    merged = existing + [c for c in codes if c not in existing]
+                    merged = existing + [c for c in selected_codes if c not in existing]
                     st.session_state.rows = build_rows_from_skus(merged, cost_map, price_map, st.session_state.rows)
-                    st.session_state.name_search_results = []
+                    for code, _ in matches:
+                        st.session_state.pop(f"name_chk_{code}", None)
                     st.rerun()
 
 st.subheader("3. 수수료 · 배송비 일괄 적용")
@@ -690,7 +690,12 @@ with b4:
                 r["수수료"] = bulk_fee
                 r["배송비"] = bulk_ship
 
-st.subheader("4. 결과표")
+h1, h2 = st.columns([5, 1])
+with h1:
+    st.subheader("4. 결과표")
+with h2:
+    st.write("")
+    delete_clicked = st.button("선택사항 삭제", key="delete_selected_rows")
 
 if not st.session_state.rows:
     st.info("기준 파일을 업로드하고 품번을 조회하면 결과가 표시됩니다.")
@@ -704,7 +709,8 @@ else:
     st.caption(
         "※ 적용유형에서 금액이 비어있는 항목을 고르면 아래 결과표에 노란색으로 표시됩니다 "
         "(선택 자체는 가능하지만 금액이 없어 계산에서 제외됩니다). "
-        "'적용' 체크박스는 '체크된 행에만 적용' 버튼을 눌렀을 때의 대상 여부입니다."
+        "'적용' 체크박스는 '체크된 행에만 적용' 버튼을 눌렀을 때의 대상 여부입니다. "
+        "'공급가(+VAT) 수동입력'에 값을 넣으면 그 값 기준으로 나머지가 계산됩니다 (비우면 자동 계산으로 복귀)."
     )
 
     edited = st.data_editor(
@@ -712,7 +718,7 @@ else:
         column_order=[
             "선택", "품번", "상품코드", "품명", "정상가", "최저가", "상시가",
             "day7", "day3", "공동구매가", "적용타입", "기타금액", "수수료", "배송비",
-            "rocket", "arrival",
+            "공급가_수동", "rocket", "arrival",
         ],
         column_config={
             "선택": st.column_config.CheckboxColumn("적용", default=True),
@@ -729,6 +735,7 @@ else:
             "기타금액": st.column_config.NumberColumn("기타 금액(적용유형=기타일 때)"),
             "수수료": st.column_config.NumberColumn("수수료(%)"),
             "배송비": st.column_config.NumberColumn("배송비"),
+            "공급가_수동": st.column_config.NumberColumn("공급가(+VAT) 수동입력"),
             "rocket": st.column_config.TextColumn("로켓배송", disabled=True),
             "arrival": st.column_config.TextColumn("도착배송", disabled=True),
         },
@@ -740,6 +747,10 @@ else:
     st.session_state.rows = [
         {k: clean_nan(v) for k, v in row.items()} for row in edited.to_dict("records")
     ]
+
+    if delete_clicked:
+        st.session_state.rows = [r for r in st.session_state.rows if not r.get("선택", False)]
+        st.rerun()
 
     recent_skus = load_recent_skus(selected_channel, days=14) if selected_channel else set()
 
@@ -793,11 +804,11 @@ else:
         return [""] * len(row)
 
     def highlight_recent(col):
-        return ["border: 2px solid #d33; font-weight: 700;" if recent_flags[i] else "" for i in range(len(col))]
+        return ["color: #d33333; font-weight: 700;" if recent_flags[i] else "" for i in range(len(col))]
 
     if selected_channel and any(recent_flags):
         st.warning(
-            "🔴 빨간 테두리로 표시된 품번은 최근 14일 이내에 같은 판매처('"
+            "🔴 빨간 굵은 글씨로 표시된 품번은 최근 14일 이내에 같은 판매처('"
             + selected_channel + "')로 이미 엑셀 다운로드한 이력이 있습니다."
         )
 
