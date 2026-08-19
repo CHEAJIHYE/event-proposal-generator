@@ -4,7 +4,9 @@ from datetime import date
 
 import pandas as pd
 import streamlit as st
-from openpyxl import load_workbook
+from openpyxl import load_workbook, Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
 try:
     import xlrd
@@ -209,6 +211,66 @@ def calc_row(r, cost_raw):
         "공헌이익": margin,
         "공헌이익률": margin_rate,
     }
+
+
+MONEY_COLUMNS = {
+    "정상가(판매가)", "최저가", "상시할인가", "7일 행사가(폐쇄몰)", "3일 행사가",
+    "공동구매가", "적용행사가", "할인금액", "원가(+VAT)", "원가(-VAT)",
+    "수수료(%)", "배송비", "공급가(+VAT)", "공급가(-VAT)", "공헌이익",
+}
+
+
+def build_styled_excel(df, missing_flags):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "행사제안서"
+
+    headers = list(df.columns)
+    ws.append(headers)
+
+    header_fill = PatternFill(start_color="ED7D31", end_color="ED7D31", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFF")
+    missing_fill = PatternFill(start_color="FFF3B0", end_color="FFF3B0", fill_type="solid")
+    thin = Side(style="thin", color="D9D9D9")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    for c in range(1, len(headers) + 1):
+        cell = ws.cell(row=1, column=c)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = border
+
+    for row_vals in df.itertuples(index=False):
+        ws.append(list(row_vals))
+
+    for r in range(2, ws.max_row + 1):
+        is_missing = missing_flags[r - 2] if (r - 2) < len(missing_flags) else False
+        for c in range(1, len(headers) + 1):
+            cell = ws.cell(row=r, column=c)
+            cell.border = border
+            header = headers[c - 1]
+            cell.alignment = Alignment(
+                horizontal="right" if header in MONEY_COLUMNS else "left", vertical="center"
+            )
+            if header in MONEY_COLUMNS and isinstance(cell.value, (int, float)):
+                cell.number_format = "#,##0"
+            if is_missing:
+                cell.fill = missing_fill
+
+    for idx, h in enumerate(headers, start=1):
+        col_vals = [str(v) for v in df[h].tolist()]
+        max_len = max([len(str(h))] + [len(v) for v in col_vals]) if col_vals else len(str(h))
+        ws.column_dimensions[get_column_letter(idx)].width = min(max(max_len + 4, 10), 32)
+
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    ws.row_dimensions[1].height = 22
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
 
 
 def pick_default_type(price):
@@ -417,9 +479,7 @@ else:
 
     st.dataframe(result_df.style.apply(highlight_missing, axis=1), use_container_width=True, hide_index=True)
 
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        result_df.to_excel(writer, index=False, sheet_name="행사제안서")
+    buf = build_styled_excel(result_df, missing_flags)
     st.download_button(
         "엑셀로 다운로드",
         data=buf.getvalue(),
