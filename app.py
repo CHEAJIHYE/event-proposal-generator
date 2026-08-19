@@ -189,10 +189,10 @@ def calc_row(r, cost_raw):
     discount_rate = (1 - event_price / r["정상가"]) if r.get("정상가") and event_price is not None else None
     discount_amt = (r["정상가"] - event_price) if r.get("정상가") is not None and event_price is not None else None
     cost_vat_in = cost_raw
-    cost_vat_ex = round(cost_raw * 1.1) if cost_raw is not None else None
+    cost_vat_ex = round(cost_raw / 1.1) if cost_raw is not None else None
     fee_dec = (r.get("수수료") or 0) / 100
     supply_vat_in = round(event_price * (1 - fee_dec)) if event_price is not None else None
-    supply_vat_ex = round(supply_vat_in * 1.1) if supply_vat_in is not None else None
+    supply_vat_ex = round(supply_vat_in / 1.1) if supply_vat_in is not None else None
     margin = (
         supply_vat_ex - cost_vat_ex - (r.get("배송비") or 0)
         if supply_vat_ex is not None and cost_vat_ex is not None
