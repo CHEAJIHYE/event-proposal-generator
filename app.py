@@ -22,8 +22,11 @@ st.set_page_config(page_title="행사제안서 자동생성기", layout="wide")
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 COST_DIR = os.path.join(DATA_DIR, "cost")
 PRICE_DIR = os.path.join(DATA_DIR, "price")
+CHANNEL_DIR = os.path.join(DATA_DIR, "channel")
+LOG_PATH = os.path.join(DATA_DIR, "download_log.csv")
 os.makedirs(COST_DIR, exist_ok=True)
 os.makedirs(PRICE_DIR, exist_ok=True)
+os.makedirs(CHANNEL_DIR, exist_ok=True)
 
 # ---------------------------------------------------------------
 # 고정 컬럼 위치 (0-indexed, A=0)
@@ -193,6 +196,39 @@ def parse_price_sheet(rows):
     return result
 
 
+def parse_channel_sheet(rows):
+    """판매처별 매핑 파일: 오클릭 품번 <-> 어드민 상품코드.
+    헤더 텍스트에서 '오클릭'이 포함된 컬럼을 오클릭 품번, '어드민'+'상품코드'가 포함된 컬럼을
+    어드민 상품코드로 인식한다. 못 찾으면 A열=어드민 상품코드, B열=오클릭 품번으로 가정."""
+    header_row, _ = find_header_row(rows, ["오클릭", "어드민", "상품코드", "품번"], 2)
+    if header_row == -1:
+        header_row = 0
+    hrow = rows[header_row] if header_row < len(rows) else []
+    c_admin, c_oclick = None, None
+    for ci, cell in enumerate(hrow):
+        v = str(cell).strip() if cell is not None else ""
+        if "오클릭" in v and c_oclick is None:
+            c_oclick = ci
+        if "어드민" in v and "상품코드" in v and c_admin is None:
+            c_admin = ci
+    if c_admin is None:
+        c_admin = 0
+    if c_oclick is None:
+        c_oclick = 1
+    result = {}
+    for r in range(header_row + 1, len(rows)):
+        row = rows[r]
+        if not row:
+            continue
+        oclick_code = normalize_code(get(row, c_oclick))
+        if not oclick_code:
+            continue
+        admin_code = str(get(row, c_admin)).strip() if get(row, c_admin) != "" else ""
+        if admin_code:
+            result[oclick_code] = admin_code
+    return result
+
+
 def calc_row(r, cost_raw):
     event_price = r["기타금액"] if r["적용타입"] == "기타" else r.get(r["적용타입"])
     price_missing = event_price is None  # 선택한 항목의 금액이 비어있음
@@ -230,7 +266,7 @@ MONEY_COLUMNS = {
 }
 
 
-def build_styled_excel(df, missing_flags):
+def build_styled_excel(df, missing_flags, recent_flags=None):
     wb = Workbook()
     ws = wb.active
     ws.title = "행사제안서"
@@ -242,8 +278,14 @@ def build_styled_excel(df, missing_flags):
     header_font = Font(bold=True, color="FFFFFF", size=10)
     missing_fill = PatternFill(start_color="FFF3B0", end_color="FFF3B0", fill_type="solid")
     data_font = Font(size=10)
+    red_font = Font(size=10, bold=True, color="D33333")
     thin = Side(style="thin", color="D9D9D9")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    red_thick = Side(style="medium", color="D33333")
+    red_border = Border(left=red_thick, right=red_thick, top=red_thick, bottom=red_thick)
+
+    recent_flags = recent_flags or []
+    sku_col_idx = headers.index("품번") + 1 if "품번" in headers else None
 
     for c in range(1, len(headers) + 1):
         cell = ws.cell(row=1, column=c)
@@ -257,6 +299,7 @@ def build_styled_excel(df, missing_flags):
 
     for r in range(2, ws.max_row + 1):
         is_missing = missing_flags[r - 2] if (r - 2) < len(missing_flags) else False
+        is_recent = recent_flags[r - 2] if (r - 2) < len(recent_flags) else False
         for c in range(1, len(headers) + 1):
             cell = ws.cell(row=r, column=c)
             cell.border = border
@@ -269,6 +312,10 @@ def build_styled_excel(df, missing_flags):
                 cell.number_format = "#,##0"
             if is_missing:
                 cell.fill = missing_fill
+        if is_recent and sku_col_idx:
+            sku_cell = ws.cell(row=r, column=sku_col_idx)
+            sku_cell.border = red_border
+            sku_cell.font = red_font
 
     for idx, h in enumerate(headers, start=1):
         col_vals = [str(v) for v in df[h].tolist()]
@@ -340,6 +387,58 @@ def load_saved_maps():
     return cost_map, price_map, status
 
 
+def load_saved_channels():
+    """data/channel 폴더의 파일들을 읽어 {판매처명: {오클릭품번: 어드민상품코드}} 딕셔너리를 만든다.
+    판매처명은 파일명(확장자 제외)."""
+    channel_maps, status = {}, []
+    for fn in sorted(os.listdir(CHANNEL_DIR)):
+        path = os.path.join(CHANNEL_DIR, fn)
+        ext = fn.lower().rsplit(".", 1)[-1]
+        channel_name = os.path.splitext(fn)[0]
+        try:
+            with open(path, "rb") as fh:
+                rows = read_rows(fh.read(), ext)
+            m = parse_channel_sheet(rows)
+            channel_maps[channel_name] = m
+            status.append((fn, f"판매처 매핑({channel_name})", len(m)))
+        except Exception as e:
+            status.append((fn, f"⚠️ 읽기 실패: {e}", 0))
+    return channel_maps, status
+
+
+def load_recent_skus(channel, days=14):
+    """최근 N일 이내에 해당 판매처로 다운로드 이력이 있는 품번 집합을 반환."""
+    if not channel or not os.path.exists(LOG_PATH):
+        return set()
+    try:
+        log_df = pd.read_csv(LOG_PATH, dtype=str)
+    except Exception:
+        return set()
+    if log_df.empty:
+        return set()
+    log_df["date"] = pd.to_datetime(log_df["date"], errors="coerce")
+    cutoff = pd.Timestamp(date.today()) - pd.Timedelta(days=days)
+    recent = log_df[(log_df["channel"] == channel) & (log_df["date"] >= cutoff)]
+    return set(recent["sku"].astype(str))
+
+
+def append_download_log(channel, skus):
+    """다운로드한 판매처/품번/날짜를 기록에 남긴다."""
+    if not channel or not skus:
+        return
+    today_str = date.today().isoformat()
+    new_rows = pd.DataFrame({"date": [today_str] * len(skus), "channel": [channel] * len(skus), "sku": skus})
+    if os.path.exists(LOG_PATH):
+        try:
+            existing = pd.read_csv(LOG_PATH, dtype=str)
+            combined = pd.concat([existing, new_rows], ignore_index=True)
+        except Exception:
+            combined = new_rows
+    else:
+        combined = new_rows
+    combined.to_csv(LOG_PATH, index=False)
+
+
 def build_rows_from_skus(skus, cost_map, price_map, prev_rows):
     """품번 리스트를 기준으로 결과 행을 만든다. 기존 행이 있으면 수수료/배송비/적용유형 등 편집값을 유지."""
     prev = {r["품번"]: r for r in prev_rows}
@@ -366,6 +465,7 @@ def build_rows_from_skus(skus, cost_map, price_map, prev_rows):
                 "기타금액": p.get("기타금액", None),
                 "수수료": p.get("수수료", 0.0),
                 "배송비": p.get("배송비", 0.0),
+                "선택": p.get("선택", True),
             }
         )
     return rows
@@ -443,11 +543,47 @@ with col1:
         st.info("저장된 기준 파일이 없습니다. 파일을 업로드해주세요.")
 
 cost_map, price_map, file_status = load_saved_maps()
+channel_maps, channel_status = load_saved_channels()
+file_status = file_status + channel_status
 
 with col1:
     with st.expander("파일 인식 상태 보기"):
         for name, kind, cnt in file_status:
             st.write(f"- **{name}** — {kind} ({cnt}건 인식)")
+
+st.subheader("1-2. 판매처(어드민 상품코드) 매핑 파일 업로드")
+st.caption(
+    "파일명이 그대로 판매처명이 됩니다 (예: '스마트스토어.xls' 업로드 → 판매처 드롭다운에 '스마트스토어' 추가). "
+    "오클릭 품번 ↔ 어드민 상품코드가 들어있는 파일을 올려주세요. 이 파일도 서버에 저장되어 계속 유지됩니다."
+)
+channel_uploaded = st.file_uploader(
+    "판매처 매핑 파일을 드래그하거나 클릭하여 업로드 (파일명 = 판매처명)",
+    type=["xls", "xlsx"],
+    accept_multiple_files=True,
+    key="channel_uploader",
+)
+if channel_uploaded:
+    for f in channel_uploaded:
+        with open(os.path.join(CHANNEL_DIR, f.name), "wb") as out:
+            out.write(f.getvalue())
+    st.success(f"{len(channel_uploaded)}개 판매처 매핑 파일이 저장되었습니다.")
+    channel_maps, channel_status = load_saved_channels()
+
+channel_files_on_disk = sorted(os.listdir(CHANNEL_DIR))
+if channel_files_on_disk:
+    cc1, cc2 = st.columns(2)
+    for i, fn in enumerate(channel_files_on_disk):
+        target = cc1 if i % 2 == 0 else cc2
+        c1, c2 = target.columns([4, 1])
+        c1.write(f"🏬 {os.path.splitext(fn)[0]}")
+        if c2.button("삭제", key=f"del_channel_{fn}"):
+            os.remove(os.path.join(CHANNEL_DIR, fn))
+            st.rerun()
+
+channel_options = ["(선택 안 함)"] + sorted(channel_maps.keys())
+selected_channel = st.selectbox("판매처 선택", channel_options, key="channel_select")
+if selected_channel == "(선택 안 함)":
+    selected_channel = None
 
 if "rows" not in st.session_state:
     st.session_state.rows = []
@@ -507,6 +643,7 @@ with col2:
                     st.rerun()
 
 st.subheader("3. 수수료 · 배송비 일괄 적용")
+st.caption("결과표의 '적용' 체크박스가 켜진 행에만 일괄 적용됩니다. 개별 행은 결과표에서 직접 수정할 수 있습니다.")
 b1, b2, b3 = st.columns([1, 1, 2])
 with b1:
     bulk_fee = st.number_input("수수료 일괄(%)", value=0.0, step=0.5)
@@ -515,10 +652,11 @@ with b2:
 with b3:
     st.write("")
     st.write("")
-    if st.button("전체 행에 적용"):
+    if st.button("체크된 행에 적용"):
         for r in st.session_state.rows:
-            r["수수료"] = bulk_fee
-            r["배송비"] = bulk_ship
+            if r.get("선택", True):
+                r["수수료"] = bulk_fee
+                r["배송비"] = bulk_ship
 
 st.subheader("4. 결과표")
 
@@ -533,17 +671,19 @@ else:
 
     st.caption(
         "※ 적용유형에서 금액이 비어있는 항목을 고르면 아래 결과표에 노란색으로 표시됩니다 "
-        "(선택 자체는 가능하지만 금액이 없어 계산에서 제외됩니다)."
+        "(선택 자체는 가능하지만 금액이 없어 계산에서 제외됩니다). "
+        "'적용' 체크박스는 수수료·배송비 일괄 적용 대상 여부입니다."
     )
 
     edited = st.data_editor(
         edit_df,
         column_order=[
-            "품번", "상품코드", "품명", "정상가", "최저가", "상시가",
+            "선택", "품번", "상품코드", "품명", "정상가", "최저가", "상시가",
             "day7", "day3", "공동구매가", "적용타입", "기타금액", "수수료", "배송비",
             "rocket", "arrival",
         ],
         column_config={
+            "선택": st.column_config.CheckboxColumn("적용", default=True),
             "품번": "품번",
             "상품코드": "상품코드",
             "품명": "품명",
@@ -567,15 +707,23 @@ else:
     )
     st.session_state.rows = edited.to_dict("records")
 
+    recent_skus = load_recent_skus(selected_channel, days=14) if selected_channel else set()
+
     display_rows = []
     missing_flags = []
+    recent_flags = []
     for r in st.session_state.rows:
         cost_raw = cost_map.get(r["품번"], {}).get("원가")
         c = calc_row(r, cost_raw)
         missing_flags.append(c["price_missing"])
+        recent_flags.append(r["품번"] in recent_skus)
+        admin_code = "-"
+        if selected_channel:
+            admin_code = channel_maps.get(selected_channel, {}).get(r["품번"], "미등록")
         display_rows.append(
             {
                 "품번": r["품번"],
+                "어드민 상품코드": admin_code,
                 "품명": r["품명"],
                 "정상가(판매가)": iround(r["정상가"]),
                 "최저가": iround(r["최저가"]),
@@ -598,6 +746,10 @@ else:
                 "도착배송": r["arrival"],
             }
         )
+    if not selected_channel:
+        for d in display_rows:
+            del d["어드민 상품코드"]
+
     result_df = pd.DataFrame(display_rows)
 
     def highlight_missing(row):
@@ -606,12 +758,28 @@ else:
             return ["background-color: #fff3b0"] * len(row)
         return [""] * len(row)
 
-    st.dataframe(result_df.style.apply(highlight_missing, axis=1), use_container_width=True, hide_index=True)
+    def highlight_recent(col):
+        return ["border: 2px solid #d33; font-weight: 700;" if recent_flags[i] else "" for i in range(len(col))]
 
-    buf = build_styled_excel(result_df, missing_flags)
-    st.download_button(
+    if selected_channel and any(recent_flags):
+        st.warning(
+            "🔴 빨간 테두리로 표시된 품번은 최근 14일 이내에 같은 판매처('"
+            + selected_channel + "')로 이미 엑셀 다운로드한 이력이 있습니다."
+        )
+
+    styled = result_df.style.apply(highlight_missing, axis=1)
+    if any(recent_flags):
+        styled = styled.apply(highlight_recent, subset=["품번"])
+
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+    buf = build_styled_excel(result_df, missing_flags, recent_flags)
+    channel_label = selected_channel if selected_channel else "전체"
+    downloaded = st.download_button(
         "엑셀로 다운로드",
         data=buf.getvalue(),
-        file_name=f"행사제안서_{date.today().isoformat()}.xlsx",
+        file_name=f"행사제안서_{channel_label}_{date.today().isoformat()}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+    if downloaded and selected_channel:
+        append_download_log(selected_channel, [r["품번"] for r in st.session_state.rows])
