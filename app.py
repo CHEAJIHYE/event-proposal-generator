@@ -1,6 +1,8 @@
 import io
 import os
 import re
+import math
+import difflib
 from datetime import date
 
 import pandas as pd
@@ -344,8 +346,17 @@ def pick_default_type(price):
 
 def iround(v):
     """숫자면 소수점 이하를 버리고 정수로, 아니면 그대로 반환."""
+    if isinstance(v, float) and math.isnan(v):
+        return None
     if isinstance(v, (int, float)):
         return int(round(v))
+    return v
+
+
+def clean_nan(v):
+    """pandas가 빈 값을 NaN으로 바꿔놓은 것을 다시 None으로 되돌린다."""
+    if isinstance(v, float) and math.isnan(v):
+        return None
     return v
 
 
@@ -472,16 +483,89 @@ def build_rows_from_skus(skus, cost_map, price_map, prev_rows):
 
 
 def search_by_name(query, cost_map):
-    """공백으로 구분된 키워드가 순서 상관없이 모두 포함된 품명을 검색."""
+    """공백으로 구분된 키워드가 순서 상관없이 모두 포함된 품명을 검색.
+    한글로 적은 외래어(예: '프로')와 상품명 속 영어 표기('Pro')도 발음 유사도로 매칭한다."""
     tokens = [t for t in re.split(r"\s+", query.strip()) if t]
     if not tokens:
         return []
     matches = []
     for code, info in cost_map.items():
         name = info.get("품명", "")
-        if all(tok in name for tok in tokens):
+        name_words = [w for w in re.split(r"[\s/,\-()]+", name) if w]
+        ok = True
+        for tok in tokens:
+            if tok in name:
+                continue
+            if any(phonetic_match(tok, w) for w in name_words):
+                continue
+            ok = False
+            break
+        if ok:
             matches.append((code, name))
     return matches
+
+
+# ---------------------------------------------------------------
+# 한글 외래어 표기 <-> 영어 표기 발음 유사도 매칭
+# (예: '플라즈마 프로' 검색 → 상품명 속 'Plasma Pro'도 함께 찾아줌)
+# ---------------------------------------------------------------
+_CHO = ["g", "kk", "n", "d", "tt", "r", "m", "b", "pp", "s", "ss", "", "j", "jj", "ch", "k", "t", "p", "h"]
+_JUNG = ["a", "ae", "ya", "yae", "eo", "e", "yeo", "ye", "o", "wa", "wae", "oe", "yo", "u", "wo", "we", "wi", "yu", "eu", "ui", "i"]
+_JONG = ["", "g", "kk", "gs", "n", "nj", "nh", "d", "l", "lg", "lm", "lb", "ls", "lt", "lp", "lh", "m", "b", "bs", "s", "ss", "ng", "j", "ch", "k", "t", "p", "h"]
+
+
+def _romanize(text):
+    out = []
+    for ch in text:
+        code = ord(ch)
+        if 0xAC00 <= code <= 0xD7A3:
+            idx = code - 0xAC00
+            cho, jung, jong = idx // (21 * 28), (idx % (21 * 28)) // 28, idx % 28
+            out.append(_CHO[cho] + _JUNG[jung] + _JONG[jong])
+        elif ch.isalpha():
+            out.append(ch.lower())
+    return "".join(out)
+
+
+def _phonetic_simplify(s, is_english=False):
+    s = s.lower()
+    s = re.sub(r"[^a-z]", "", s)
+    if is_english:
+        s = re.sub(r"([aeiou])r$", r"\1", s)  # 영어 -er/-or/-ar 끝의 r 탈락(한국어 표기 관행)
+    s = s.replace("eu", "")  # 자음 뒤 삽입되는 필러 모음 제거
+    s = s.replace("c", "k")
+    s = s.replace("x", "ks")
+    s = s.replace("j", "s")
+    s = s.replace("z", "s")
+    s = s.replace("g", "k")  # 종성 유/무성 중화
+    s = s.replace("b", "p")
+    s = s.replace("d", "t")
+    s = re.sub(r"(.)\1+", r"\1", s)  # 중복 자음 정리
+    return s
+
+
+def _skeleton(s):
+    return re.sub(r"[aeiou]", "", s)
+
+
+def phonetic_match(a, b, threshold=0.6):
+    """토큰 a, b 중 하나가 한글이고 하나가 영어여도(또는 둘 다 한글/영어여도)
+    발음이 비슷하면 True. (예: '프로' ~ 'Pro', '플라즈마' ~ 'Plasma')"""
+    is_a_kor = bool(re.search(r"[가-힣]", a))
+    is_b_kor = bool(re.search(r"[가-힣]", b))
+    sa = _phonetic_simplify(_romanize(a), is_english=not is_a_kor)
+    sb = _phonetic_simplify(_romanize(b), is_english=not is_b_kor)
+    if not sa or not sb:
+        return False
+    if sa == sb or sa in sb or sb in sa:
+        return True
+    ka, kb = _skeleton(sa), _skeleton(sb)
+    if len(ka) >= 2 and len(kb) >= 2:
+        if ka == kb or ka in kb or kb in ka:
+            return True
+        if difflib.SequenceMatcher(None, ka, kb).ratio() >= threshold:
+            return True
+    return difflib.SequenceMatcher(None, sa, sb).ratio() >= threshold
 
 
 def show_no_match_popup(query):
@@ -627,8 +711,9 @@ with col2:
 
     with tab_name:
         name_query = st.text_input(
-            "품명 키워드를 입력하세요 (띄어쓰기로 구분, 순서 상관없이 검색됩니다)",
-            placeholder="예: 크리스탈 램프",
+            "품명 키워드를 입력하세요 (띄어쓰기로 구분, 순서 상관없이 검색됩니다. "
+            "'플라즈마 프로'처럼 한글로 적어도 상품명 속 영어 표기(Plasma Pro 등)를 찾아줍니다)",
+            placeholder="예: 크리스탈 램프 / 플라즈마 프로",
         )
         search_clicked = st.button("검색", key="search_by_name")
         if search_clicked:
@@ -727,7 +812,9 @@ else:
         use_container_width=True,
         key="editor",
     )
-    st.session_state.rows = edited.to_dict("records")
+    st.session_state.rows = [
+        {k: clean_nan(v) for k, v in row.items()} for row in edited.to_dict("records")
+    ]
 
     recent_skus = load_recent_skus(selected_channel, days=14) if selected_channel else set()
 
