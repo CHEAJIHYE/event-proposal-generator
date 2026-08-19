@@ -805,7 +805,8 @@ else:
     if any(recent_flags):
         styled = styled.apply(highlight_recent, subset=["품번"])
 
-    st.dataframe(styled, use_container_width=True, hide_index=True)
+    screen_number_cols = {c: st.column_config.NumberColumn(c, format="%d") for c in MONEY_COLUMNS if c in result_df.columns}
+    st.dataframe(styled, column_config=screen_number_cols, use_container_width=True, hide_index=True)
 
     buf = build_styled_excel(result_df, missing_flags, recent_flags)
     channel_label = selected_channel if selected_channel else "전체"
